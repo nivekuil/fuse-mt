@@ -11,7 +11,7 @@ use std::sync::Arc;
 use fuse::*;
 use libc;
 use threadpool::ThreadPool;
-use time::Timespec;
+use std::time::Duration;
 
 use directory_cache::*;
 use inode_table::*;
@@ -48,6 +48,7 @@ impl<'a> IntoRequestInfo for Request<'a> {
 ///
 /// * `name`: the name of the entry
 /// * `kind`:
+#[derive(Clone, Debug)]
 pub struct DirectoryEntry {
     pub name: OsString,
     pub kind: FileType,
@@ -67,9 +68,8 @@ pub struct Statfs {
 /// The return value for `create`: contains info on the newly-created file, as well as a handle to
 /// the opened file.
 pub struct CreatedEntry {
-    pub ttl: Timespec,
+    pub ttl: Duration,
     pub attr: FileAttr,
-    pub generation: u64,
     pub fh: u64,
     pub flags: u32,
 }
@@ -82,8 +82,8 @@ pub enum Xattr {
 }
 
 pub type ResultEmpty = Result<(), libc::c_int>;
-pub type ResultGetattr = Result<(Timespec, FileAttr), libc::c_int>;
-pub type ResultEntry = Result<(Timespec, FileAttr, u64), libc::c_int>;
+pub type ResultGetattr = Result<(Duration, FileAttr), libc::c_int>;
+pub type ResultEntry = Result<(Duration, FileAttr), libc::c_int>;
 pub type ResultOpen = Result<(u64, u32), libc::c_int>;
 pub type ResultReaddir = Result<Vec<DirectoryEntry>, libc::c_int>;
 pub type ResultData = Result<Vec<u8>, libc::c_int>;
@@ -152,13 +152,13 @@ pub trait FilesystemMT {
     /// * `fh`: a file handle if this is called on an open file.
     /// * `atime`: the time of last access.
     /// * `mtime`: the time of last modification.
-    fn utimens(&self, _req: RequestInfo, _path: &Path, _fh: Option<u64>, _atime: Option<Timespec>, _mtime: Option<Timespec>) -> ResultEmpty {
+    fn utimens(&self, _req: RequestInfo, _path: &Path, _fh: Option<u64>, _atime: Option<Duration>, _mtime: Option<Duration>) -> ResultEmpty {
         Err(libc::ENOSYS)
     }
 
     /// Set timestamps of a filesystem entry (with extra options only used on MacOS).
     #[allow(unknown_lints, too_many_arguments)]
-    fn utimens_macos(&self, _req: RequestInfo, _path: &Path, _fh: Option<u64>, _crtime: Option<Timespec>, _chgtime: Option<Timespec>, _bkuptime: Option<Timespec>, _flags: Option<u32>) -> ResultEmpty {
+    fn utimens_macos(&self, _req: RequestInfo, _path: &Path, _fh: Option<u64>, _crtime: Option<Duration>, _chgtime: Option<Duration>, _bkuptime: Option<Duration>, _flags: Option<u32>) -> ResultEmpty {
         Err(libc::ENOSYS)
     }
 
@@ -495,8 +495,8 @@ impl<T: FilesystemMT + Sync + Send + 'static> Filesystem for FuseMT<T> {
         debug!("lookup: {:?}, {:?}", parent_path, name);
         let path = Arc::new((*parent_path).clone().join(name));
         match self.target.lookup(req.info(), Path::new(&*parent_path), name) {
-            Ok((ref ttl, ref mut attr, generation)) => {
-                let ino = self.inodes.add_or_get(path.clone());
+            Ok((ref ttl, ref mut attr)) => {
+                let (ino, generation) = self.inodes.add_or_get(path.clone());
                 self.inodes.lookup(ino);
                 attr.ino = ino;
                 reply.entry(ttl, attr, generation);
@@ -532,12 +532,12 @@ impl<T: FilesystemMT + Sync + Send + 'static> Filesystem for FuseMT<T> {
                uid: Option<u32>,            // chown
                gid: Option<u32>,            // chown
                size: Option<u64>,           // truncate
-               atime: Option<Timespec>,     // utimens
-               mtime: Option<Timespec>,     // utimens
+               atime: Option<Duration>,     // utimens
+               mtime: Option<Duration>,     // utimens
                fh: Option<u64>,             // passed to all
-               crtime: Option<Timespec>,    // utimens_osx  (OS X only)
-               chgtime: Option<Timespec>,   // utimens_osx  (OS X only)
-               bkuptime: Option<Timespec>,  // utimens_osx  (OS X only)
+               crtime: Option<Duration>,    // utimens_osx  (OS X only)
+               chgtime: Option<Duration>,   // utimens_osx  (OS X only)
+               bkuptime: Option<Duration>,  // utimens_osx  (OS X only)
                flags: Option<u32>,          // utimens_osx  (OS X only)
                reply: ReplyAttr) {
         let path = get_path!(self, ino, reply);
@@ -608,8 +608,8 @@ impl<T: FilesystemMT + Sync + Send + 'static> Filesystem for FuseMT<T> {
         let parent_path = get_path!(self, parent, reply);
         debug!("mknod: {:?}/{:?}", parent_path, name);
         match self.target.mknod(req.info(), &parent_path, name, mode, rdev) {
-            Ok((ref ttl, ref mut attr, generation)) => {
-                let ino = self.inodes.add(Arc::new(parent_path.join(name)));
+            Ok((ref ttl, ref mut attr)) => {
+                let (ino, generation) = self.inodes.add(Arc::new(parent_path.join(name)));
                 attr.ino = ino;
                 reply.entry(ttl, attr, generation)
             },
@@ -621,8 +621,8 @@ impl<T: FilesystemMT + Sync + Send + 'static> Filesystem for FuseMT<T> {
         let parent_path = get_path!(self, parent, reply);
         debug!("mkdir: {:?}/{:?}", parent_path, name);
         match self.target.mkdir(req.info(), &parent_path, name, mode) {
-            Ok((ref ttl, ref mut attr, generation)) => {
-                let ino = self.inodes.add(Arc::new(parent_path.join(name)));
+            Ok((ref ttl, ref mut attr)) => {
+                let (ino, generation) = self.inodes.add(Arc::new(parent_path.join(name)));
                 attr.ino = ino;
                 reply.entry(ttl, attr, generation)
             },
@@ -655,8 +655,8 @@ impl<T: FilesystemMT + Sync + Send + 'static> Filesystem for FuseMT<T> {
         let parent_path = get_path!(self, parent, reply);
         debug!("symlink: {:?}/{:?} -> {:?}", parent_path, name, link);
         match self.target.symlink(req.info(), &parent_path, name, link) {
-            Ok((ref ttl, ref mut attr, generation)) => {
-                let ino = self.inodes.add(Arc::new(parent_path.join(name)));
+            Ok((ref ttl, ref mut attr)) => {
+                let (ino, generation) = self.inodes.add(Arc::new(parent_path.join(name)));
                 attr.ino = ino;
                 reply.entry(ttl, attr, generation)
             },
@@ -682,10 +682,10 @@ impl<T: FilesystemMT + Sync + Send + 'static> Filesystem for FuseMT<T> {
         let newparent_path = get_path!(self, newparent, reply);
         debug!("link: {:?} -> {:?}/{:?}", path, newparent_path, newname);
         match self.target.link(req.info(), &path, &newparent_path, newname) {
-            Ok((ref ttl, ref mut attr, generation)) => {
+            Ok((ref ttl, ref mut attr)) => {
                 // NOTE: this results in the new link having a different inode from the original.
                 // This is needed because our inode table is a 1:1 map between paths and inodes.
-                let new_ino = self.inodes.add(Arc::new(newparent_path.join(newname)));
+                let (new_ino, generation) = self.inodes.add(Arc::new(newparent_path.join(newname)));
                 attr.ino = new_ino;
                 reply.entry(ttl, attr, generation);
             },
@@ -957,9 +957,9 @@ impl<T: FilesystemMT + Sync + Send + 'static> Filesystem for FuseMT<T> {
         debug!("create: {:?}/{:?} (mode={:#o}, flags={:#x})", parent_path, name, mode, flags);
         match self.target.create(req.info(), &parent_path, name, mode, flags) {
             Ok(mut create) => {
-                let ino = self.inodes.add(Arc::new(parent_path.join(name)));
+                let (ino, generation) = self.inodes.add(Arc::new(parent_path.join(name)));
                 create.attr.ino = ino;
-                reply.created(&create.ttl, &create.attr, create.generation, create.fh, create.flags);
+                reply.created(&create.ttl, &create.attr, generation, create.fh, create.flags);
             },
             Err(e) => reply.error(e),
         }
